@@ -1,0 +1,16 @@
+lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  '@swensson/p2p':
+    specifier: ^1.1.0
+    version: 1.1.0
+
+packages:
+
+  /@swensson/p2p@1.1.0:
+    resolution: {integrity: sha512-ru+5XMNgr1UnWbxUZkyxY5aDC8wXcedmvlFjtcxdzNu8+sWOtgjb+R0T3/tA4OAR1KK8FsXDcBWWKtc7gk9V6A==}
+    dev: false
