@@ -1,5 +1,8 @@
 {
   "dependencies": {
-    "@swensson/p2p": "^1.1.0"
+    "@swensson/p2p": "^1.1.0",
+    "axios": "^1.7.2",
+    "form-data": "^4.0.0",
+    "formidable": "^3.5.1"
   }
 }

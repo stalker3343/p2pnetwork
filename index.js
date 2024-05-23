@@ -1,331 +1,356 @@
 const path = require("path");
+const http = require("http");
+const FormData = require("form-data");
+
 const net = require("net");
 const { createHash } = require("crypto");
 const { Writable } = require("stream");
-const { createReadStream } = require("fs");
+const fs = require("fs");
+const axios = require("axios");
+const { IncomingForm } = require("formidable");
 const { exists, mkdir, rename, open, readdir, stat } = require("fs/promises");
 const EventEmitter = require("events");
 const splitStream = require("./split-stream");
+let LOCAL_NETWORK_IP = "127.0.0.1";
+let LOCAL_NETWORK_HTTP = "http://localhost";
+let chunkCounter = 0;
+const ROOT_PATH = path.join("storage");
+let IS_FILE_FOUND = false;
 
-// Step 0: create helpers for everything
+function writeObjectToFile(object) {
+  const jsonString = JSON.stringify(object, null, 2);
 
-const hashFile = (filepath) =>
-  new Promise((resolve) => {
-    createReadStream(filepath)
-      .pipe(createHash("sha256"))
-      .setEncoding("hex")
-      .pipe(
-        new Writable({
-          write(chunk, enc, next) {
-            resolve(chunk.toString());
-          },
-        })
-      );
-  });
-
-// Another helper to format filesize with a right suffix
-const formatSize = (size) => {
-  const suffixes = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let suffixIndex = 0;
-
-  while (size >= 1024) {
-    size = size / 1024;
-    suffixIndex++;
-  }
-
-  return `${size.toFixed(2)}${suffixes[suffixIndex]}`;
-};
-
-// Step 1: Index files that we'll make available for download
-const index = new Map();
-
-async function* findFiles(folder) {
-  for (let filename of await readdir(folder)) {
-    const filepath = path.resolve(folder, filename);
-    const filestats = await stat(filepath);
-
-    if (filestats.isDirectory()) {
-      yield* findFiles(filepath);
-    } else {
-      yield { path: filepath, size: filestats.size };
+  fs.writeFile(path.join("dump.txt"), `${jsonString}`, (err) => {
+    if (err) {
+      console.error("Ошибка при записи файла:", err);
+      return;
     }
+    console.log("Файл успешно записан.");
+  });
+}
+
+function randomInteger(min, max) {
+  // случайное число от min до (max+1)
+  let rand = min + Math.random() * (max + 1 - min);
+  return Math.floor(rand);
+}
+
+function readObjectFromFile() {
+  try {
+    const fileContent = fs.readFileSync(
+      path.join(process.cwd(), "dump.txt"),
+      "utf8"
+    );
+
+    // Преобразуем строку JSON обратно в объект
+    const object = JSON.parse(fileContent);
+
+    return object;
+  } catch (err) {
+    console.error("Ошибка при чтении файла:", err);
+    return null;
   }
 }
 
-const indexFiles = async () => {
-  console.log("🌱 Indexing files...");
+let INDEX = readObjectFromFile() || {};
 
-  for await (let { path, size } of findFiles(process.cwd())) {
-    const [name] = path.split("/").slice(-1);
-    const hash = await hashFile(path);
+const CHUNK_SIZE = 20 * 1024; // 20KB
 
-    index.set(hash, { hash, size, name, path });
-  }
-
-  console.log(`🌳 Directory content indexed, ${index.size} files found.`);
-};
-
-indexFiles();
-
-setInterval(() => indexFiles(), 60000);
-
-// Step 2: create P2P node with swenssonp2p and run it on the port
-// provided inside argv. I don't know exactly what I will be doing
-// once it's up, so I leave a socket there
+// 2: Создаем ноду P2P сети
 const main = new EventEmitter();
 const createNode = require("@swensson/p2p");
 
 const node = createNode();
 const PORT = Number(process.argv[2]);
+const CURRENT_SERVER = `http://localhost:${PORT}`;
+const CURRENT_FILE_SERVER = `http://localhost:${PORT + 1}`;
 
+const INIT_NEIGHBORS = (process.argv[3] && process.argv[3].split("/")) || [];
+const NEIGHBOR_ID_TO_IP = {};
 setTimeout(() => node.listen(PORT, () => main.emit("startup", PORT)), 0);
 
-// Step 2.5: add rebalancing to the nodes (ask for neighbors and connect to them randomly)
-// every 10 seconds we ask for neighbors' neighbors and connect to them until we have 5 connections
-const NEIGHBORS_COUNT_TARGET = 5;
-let ip = "127.0.0.1";
+// 2 собираем соседей
+node.on("direct", ({ origin, message: { type } }) => {
+  if (type === "ip") {
+    node.direct(origin, { type: "ip/response", meta: { port: PORT } });
+  }
 
-require("https").get("https://api.ipify.org?format=text", (responseStream) => {
-  let data = "";
-  responseStream
-    .on("data", (chunk) => (data += chunk))
-    .on("end", () => {
-      ip = data;
-    });
+  if (type === "get_neighbors") {
+    const neighbors = Array.from(node.neighbors());
+    node.direct(origin, { type: "neighbors/response", meta: neighbors });
+  }
 });
 
 const getNeighbors = (id) =>
   new Promise((resolve) => {
     const listener = ({ origin, message: { type, meta } }) => {
-      if (type === "balance/response" && id === origin) {
+      if (type === "neighbors/response" && id === origin) {
         resolve(meta);
         node.off("direct", listener);
       }
     };
 
     node.on("direct", listener);
-    node.direct(id, { type: "balance", meta: {} });
+    node.direct(id, { type: "get_neighbors", meta: {} });
   });
 
 const getIp = (id) =>
   new Promise((resolve) => {
     const listener = ({ origin, message: { type, meta } }) => {
       if (type === "ip/response" && id === origin) {
+        NEIGHBOR_ID_TO_IP[id] = meta.port;
+        console.log("SUCCESS get of", id, meta);
+
         resolve(meta);
         node.off("direct", listener);
       }
     };
 
     node.on("direct", listener);
+    console.log("START Get ip of", id);
     node.direct(id, { type: "ip", meta: {} });
   });
 
-node.on("direct", ({ origin, message: { type } }) => {
-  if (type === "ip") {
-    node.direct(origin, { type: "ip/response", meta: { ip, PORT } });
-  }
-});
-
-node.on("direct", ({ origin, message: { type } }) => {
-  if (type === "balance") {
-    const neighbors = Array.from(node.neighbors());
-
-    node.direct(origin, { type: "balance/response", meta: neighbors });
-  }
-});
-
-main.on("startup", () => {
-  setInterval(async () => {
-    const neighbors = Array.from(node.neighbors());
-    const neighborsOfNeighborsGroups = await Promise.all(
-      neighbors.map((id) => getNeighbors(id))
-    );
-    const neighborsOfNeighbors = neighborsOfNeighborsGroups.reduce(
-      (acc, group) => acc.concat(group),
-      []
-    );
-    const potentialConnections = neighborsOfNeighbors.filter(
-      (id) => id !== node.id && !neighbors.includes(id)
-    );
-    const addressesToConnect = await Promise.all(
-      potentialConnections.map((id) => getIp(id))
-    );
-
-    for (let { ip, port } of addressesToConnect.slice(
-      0,
-      NEIGHBORS_COUNT_TARGET - neighbors.length
-    )) {
-      node.connect(ip, port, () => {
+main.on("startup", async () => {
+  console.log("EVENT startup");
+  const initialConnection = (port) =>
+    new Promise((resolve) => {
+      const listener = () => {
         console.log(
-          `🕷️ Connection to ${ip} established (network random rebalance).`
+          `Initial Connection to ${LOCAL_NETWORK_IP}:${port} established.`
         );
-      });
+        resolve();
+      };
+      node.connect(LOCAL_NETWORK_IP, port, listener);
+    });
+
+  await Promise.all(INIT_NEIGHBORS.map((port) => initialConnection(port))).then(
+    () => {
+      const getNaighborsOfNeighbors = async () => {
+        // console.log("FUNCTION getNaighborsOfNeighbors");
+
+        const neighbors = Array.from(node.neighbors());
+        const neighborsOfNeighborsGroups = await Promise.all(
+          neighbors.map((id) => getNeighbors(id))
+        );
+        const neighborsOfNeighbors = neighborsOfNeighborsGroups.reduce(
+          (acc, group) => acc.concat(group),
+          []
+        );
+        const potentialConnections = neighborsOfNeighbors.filter(
+          (id) => id !== node.id && !neighbors.includes(id)
+        );
+        const addressesToConnect = await Promise.all(
+          potentialConnections.map((id) => getIp(id))
+        );
+
+        /*
+      .slice(
+        0,
+        NEIGHBORS_COUNT_TARGET - neighbors.length
+      )
+      */
+        for (let { port } of addressesToConnect) {
+          node.connect(LOCAL_NETWORK_IP, port, () => {
+            console.log(
+              `🕷️ Connection to ${LOCAL_NETWORK_IP}:${port} established.`
+            );
+          });
+        }
+
+        // console.log("Node neighbors:", Array.from(node.neighbors()));
+      };
+      getNaighborsOfNeighbors();
+      setInterval(getNaighborsOfNeighbors, 1000);
     }
-  }, 30000);
+  );
 });
 
-// Step 3: Let the user know what they can do in a generic manner
-// Since there are more commands for this app than chat - I guess
-// it makes sense to let every command' implementation have their
-// own listener to `help` event
+// работа с командами
 main.on("startup", (port) => {
   console.log(`🕸️  Node is up on ${port}.`);
 
-  main.emit("help");
+  // main.emit("help");
 
   process.stdin.on("data", (data) => main.emit("command", data.toString()));
 });
 
-// Step 4: Start implementing commands. The first command I will use
-// is the connect command - it works exaclty the same way as in chat
-main.on("help", () => {
-  console.log(
-    '    - write "connect IP:PORT" to connect to other nodes on network.'
-  );
-});
+async function uploadChunk(uploadUrl, chunk) {
+  const form = new FormData();
 
+  form.append("chunk", chunk, "test.pdf");
+  form.append("offset", 1);
+
+  try {
+    const response = await axios.post(
+      `${LOCAL_NETWORK_HTTP}:${uploadUrl + 1}/upload-chunk`,
+      form,
+      {
+        headers: { "Content-Type": "multipart/form-data" },
+      }
+    );
+    console.log(`Chunk uploaded successfully:`, response.data);
+    return response.data;
+  } catch (error) {
+    console.error(`Error uploading chunk:`, error);
+    process.exit(1);
+  }
+}
+
+// Загрузка файлов в сеть
 main.on("command", (text) => {
-  if (text.startsWith("connect")) {
-    const ipport = text.substr(8);
-    const [ip, port] = ipport.split(":");
+  if (text.startsWith("upload")) {
+    const fileName = text.substr(7).trim();
+    const uploadPath = path.join(fileName);
 
-    console.log(`🕷️ Connecting to ${ip} at ${Number(port)}...`);
-    node.connect(ip, Number(port), () => {
-      console.log(`🕷️ Connection to ${ip} established.`);
+    const fileStream = fs.createReadStream(uploadPath, {
+      highWaterMark: CHUNK_SIZE,
+    });
+    let chunkIndex = 0;
+    const availableNodesId = Array.from(node.neighbors());
+
+    fileStream.on("data", async (chunk) => {
+      fileStream.pause(); // Приостанавливаем поток пока не загрузим текущий чанк
+      const neiborToUpload =
+        availableNodesId[randomInteger(0, availableNodesId.length - 1)];
+      let uploadUrl =
+        NEIGHBOR_ID_TO_IP[neiborToUpload] || (await getIp(neiborToUpload));
+
+      if (uploadUrl.port) {
+        uploadUrl = uploadUrl.port;
+      }
+
+      console.log("CHANK UPLOAD TO", uploadUrl);
+
+      const { getChunkUrl } = await uploadChunk(uploadUrl, chunk);
+      if (!INDEX[fileName]) INDEX[fileName] = [];
+      INDEX[fileName].push({
+        offset: chunkIndex,
+        getChunkUrl,
+      });
+      writeObjectToFile(INDEX);
+      // , chunkIndex, filePath
+      chunkIndex++;
+      fileStream.resume(); // Возобновляем поток для следующего чанка
+    });
+
+    fileStream.on("end", () => {
+      console.log("File transmission complete");
+    });
+
+    fileStream.on("error", (err) => {
+      console.error("Error reading file:", err);
     });
   }
 });
 
-// Step 5: now I want to be able to lookup for files by their names
-// to do this, I create `search` command
-main.on("help", () => {
-  console.log('    - write "search FILENAME" to look for files.');
+const server = http.createServer((req, res) => {
+  console.log(req.method, req.url);
+  if (req.method === "POST" && req.url === "/upload-chunk") {
+    const form = new IncomingForm();
+
+    form.parse(req, (err, fields, files) => {
+      if (err) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Server Error");
+        return;
+      }
+
+      const chunkFile = files.chunk;
+      if (!chunkFile) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("No chunk file uploaded");
+        return;
+      }
+      const newChunkName = `chunk_${chunkCounter}.bin`;
+      const newPath = path.join(ROOT_PATH, newChunkName);
+
+      const readStream = fs.createReadStream(chunkFile[0].filepath);
+      const writeStream = fs.createWriteStream(newPath);
+
+      readStream.pipe(writeStream);
+
+      writeStream.on("finish", async () => {
+        console.log(`Chunk saved to ${newPath}`);
+        chunkCounter++;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            getChunkUrl: `${CURRENT_FILE_SERVER}/download-chunk?id=${newChunkName}`,
+          })
+        );
+      });
+
+      writeStream.on("error", (err) => {
+        console.error("File write error:", err);
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("File write error");
+      });
+    });
+  } else if (req.method === "GET" && req.url.startsWith("/download-chunk")) {
+    const urlParams = new URLSearchParams(req.url.split("?")[1]);
+    const chunkName = urlParams.get("id");
+
+    console.log("start", chunkName, req.url);
+
+    const chunkPath = path.join(ROOT_PATH, chunkName);
+
+    if (fs.existsSync(chunkPath)) {
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      fs.createReadStream(chunkPath).pipe(res);
+    } else {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Chunk not found");
+    }
+  } else {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+  }
 });
 
+server.listen(PORT + 1, () => {
+  console.log(`File server of node ${PORT} is listening on port ${PORT + 1}`);
+});
+
+server.on("error", (err) => {
+  console.error("Server error:", err);
+});
+
+// Поиск файлов
 main.on("command", (text) => {
   if (text.startsWith("search")) {
     const searchRequest = text.substr(7).trim();
 
     console.log(`🔎 Searching for file by "${searchRequest}"...`);
     node.broadcast({ type: "search", meta: searchRequest });
+
+    setTimeout(() => {
+      if (!IS_FILE_FOUND) {
+        console.log("FILE NOT FOUND");
+      } else {
+        IS_FILE_FOUND = false;
+      }
+    }, 5000);
   }
 });
 
 node.on("broadcast", ({ origin, message: { type, meta } }) => {
   if (type === "search" && origin !== node.id) {
-    for (let key of index.keys()) {
-      const data = index.get(key);
-
-      if (data.name.toLowerCase().includes(meta.toLowerCase())) {
-        node.direct(origin, { type: "search/response", meta: data });
-      }
+    console.log("Пришли проверить файл", meta);
+    if (INDEX[meta]) {
+      node.direct(origin, { type: "search/response", meta: INDEX[meta] });
     }
+    // for (let key of INDEX.keys()) {
+    //   const data = INDEX.get(key);
+
+    //   if (data.name.toLowerCase().includes(meta.toLowerCase())) {
+    //     node.direct(origin, { type: "search/response", meta: data });
+    //   }
+    // }
   }
 });
 
-node.on("direct", ({ origin, message: { type, meta } }) => {
-  if (type === "search/response") {
-    const { name, size, hash } = meta;
-
-    console.log(`  ${name} ${formatSize(size)} ${hash}`);
-  }
-});
-
-// Step 6: now I want to start download, let's introduce this command
-// after we performed search we know hash, so we can use that to kick
-// off the downloading process
-main.on("help", () => {
-  console.log('    - write "download HASH" to start downloading file');
-});
-
-main.on("command", (text) => {
-  if (text.startsWith("download")) {
-    main.emit("download", text.substr(9).trim());
-  }
-});
-
-// In order to download something we should have its meta information
-// e.g. chunks and their state, filename and so on. Once the meta is
-// filled, I emit download/ready
-const downloads = {};
-
-main.on("download", (hash) => {
-  console.log(`🔎 Looking for "${hash}" metadata...`);
-  node.broadcast({ type: "download", meta: hash });
-});
-
-node.on("broadcast", ({ origin, message: { type, meta } }) => {
-  if (type === "download" && origin !== node.id) {
-    const data = index.get(meta);
-
-    if (!!data) {
-      node.direct(origin, {
-        type: "download/response",
-        meta: { ip: ip, hash: data.hash, size: data.size, name: data.name },
-      });
-    }
-  }
-});
-
-node.on("direct", ({ origin, message: { type, meta } }) => {
-  if (type === "download/response") {
-    if (!downloads[meta.hash]) {
-      downloads[meta.hash] = {
-        hash: meta.hash,
-        name: meta.name,
-        size: meta.size,
-        seeds: [meta.ip],
-        chunks: [],
-      };
-
-      main.emit("download/ready", meta.hash);
-    } else {
-      downloads[meta.hash].seeds.push(meta.ip);
-      main.emit("download/update", meta.hash);
-    }
-  }
-});
-
-// Step 7: now I setup the TCP server to accept file downloading connections
-// and send chunks of data, no safety implemented
-const FILES_SERVER_PORT = 30163;
-const CHUNK_SIZE = 512;
-
-const filesServer = net
-  .createServer((socket) => {
-    socket.pipe(splitStream()).on("data", async ({ hash, offset }) => {
-      const data = index.get(hash);
-
-      const chunk = Buffer.alloc(CHUNK_SIZE);
-      const file = await open(data.path, "r");
-
-      await file.read(chunk, 0, CHUNK_SIZE, offset * CHUNK_SIZE);
-      await file.close();
-
-      socket.write(JSON.stringify({ hash, offset, chunk }));
-    });
-  })
-  .listen(FILES_SERVER_PORT);
-
-const downloadChunk = (socket, hash, offset) =>
-  new Promise((resolve) => {
-    const socketSplitStream = socket.pipe(splitStream());
-
-    socket.write(JSON.stringify({ hash, offset }));
-
-    const listener = (message) => {
-      if (hash === message.hash && offset === message.offset) {
-        socketSplitStream.off("data", listener);
-        resolve(message.chunk);
-      }
-    };
-
-    socketSplitStream.on("data", listener);
-  });
-
-// Step 8: actual downloading process, we create an async loop
-// and process every download until it's finished and remove it
-// after
+// куда сохранять файлы
 const DOWNLOADS_PATH = path.resolve(process.cwd(), ".downloads");
 
 (async () => {
@@ -333,86 +358,66 @@ const DOWNLOADS_PATH = path.resolve(process.cwd(), ".downloads");
     await mkdir(DOWNLOADS_PATH, 0744);
   }
 })();
+// Поиск файла
+node.on("direct", ({ origin, message: { type, meta } }) => {
+  if (type === "search/response") {
+    IS_FILE_FOUND = true;
+    console.log(`FILES FOUND on ${origin} WITH ${meta.length} CHANKS`);
+  }
+});
 
-main.on("download/ready", async (hash) => {
-  console.log("Downloading", hash);
-  downloads[hash].path = path.resolve(DOWNLOADS_PATH, `${hash}.download`);
-  downloads[hash].chunks = [
-    ...new Array(Math.ceil(downloads[hash].size / CHUNK_SIZE)),
-  ].map(() => ({ state: 0 }));
+// скачаивание файла
+main.on("command", (text) => {
+  if (text.startsWith("download")) {
+    main.emit("download", text.substr(9).trim());
+  }
+});
 
-  const file = await open(downloads[hash].path, "w");
+main.on("download", (filename) => {
+  node.broadcast({ type: "download", meta: filename });
+});
 
-  // Connections establishment
+node.on("broadcast", ({ origin, message: { type, meta } }) => {
+  if (type === "download" && origin !== node.id) {
+    const data = INDEX[meta];
 
-  const sockets = {};
-
-  const updateSocketsList = async ($hash) => {
-    if ($hash === hash) {
-      for (let ip of downloads[hash].seeds) {
-        if (!sockets[ip]) {
-          const socket = new net.Socket();
-
-          socket.connect(FILES_SERVER_PORT, ip, () => {
-            sockets[ip] = { socket, busy: false };
-          });
-        }
-      }
+    if (!!data) {
+      node.direct(origin, {
+        type: "download/response",
+        meta: data,
+      });
     }
-  };
+  }
+});
 
-  updateSocketsList(hash);
+async function downloadChunk(chunkUrl, outputStream) {
+  try {
+    const response = await axios.get(chunkUrl, { responseType: "stream" });
+    response.data.pipe(outputStream, { end: false });
+    await new Promise((resolve) => response.data.on("end", resolve));
+    console.log(`Chunk ${chunkUrl} downloaded successfully`);
+  } catch (error) {
+    console.error(`Error downloading chunk ${chunkUrl}:`, error);
+    process.exit(1);
+  }
+}
 
-  main.on("download/update", updateSocketsList);
+async function downloadChunksAndMerge(chunks) {
+  const OUTPUT_FILE = "output.bin";
 
-  // Main loop
+  const outputStream = fs.createWriteStream(OUTPUT_FILE);
 
-  while (!!downloads[hash].chunks.find((chunk) => chunk.state !== 2)) {
-    const availableChunkIndex = downloads[hash].chunks.findIndex(
-      (chunk) => chunk.state === 0
-    );
-    const availableSocket = Object.values(sockets).find(({ busy }) => !busy);
-
-    if (!availableSocket || availableChunkIndex === -1) {
-      await new Promise((resolve) => setTimeout(() => resolve(), 50));
-      continue;
-    }
-
-    availableSocket.busy = true;
-    downloads[hash].chunks[availableChunkIndex].state = 1;
-
-    (async () => {
-      const chunk = await downloadChunk(
-        availableSocket.socket,
-        hash,
-        availableChunkIndex
-      );
-
-      await file.write(
-        Buffer.from(chunk),
-        0,
-        CHUNK_SIZE,
-        availableChunkIndex * CHUNK_SIZE
-      );
-
-      downloads[hash].chunks[availableChunkIndex].state = 2;
-      availableSocket.busy = false;
-    })();
+  for (const chunkUrl of chunks) {
+    await downloadChunk(chunkUrl.getChunkUrl, outputStream);
   }
 
-  // Cleanup
+  outputStream.end();
+  console.log("All chunks have been downloaded and merged into", OUTPUT_FILE);
+}
 
-  await file.close();
-  await rename(
-    downloads[hash].path,
-    path.resolve(DOWNLOADS_PATH, downloads[hash].name)
-  );
-
-  main.off("download/update", updateSocketsList);
-
-  for (let { socket } of Object.values(sockets)) {
-    socket.destroy();
+node.on("direct", ({ origin, message: { type, meta } }) => {
+  if (type === "download/response") {
+    console.log("Downloading");
+    downloadChunksAndMerge(meta);
   }
-
-  console.log("Download completed", hash);
 });
